@@ -1,0 +1,195 @@
+# The Lex image, built and published: a version tag v<major>.<minor>.<patch> on this repository
+# (set by eMondrian/emondrian-lex's own release workflow, from the same tag there) builds the
+# image from that repository's source at that tag, for linux/amd64 and linux/arm64, each on a
+# native runner; tests it; publishes it to Docker Hub as emondrian/lex:<version> and
+# :<major>.<minor>; and then makes this repository's docker-compose.yml name the new version.
+#
+# The source is private and this repository is public, so its logs are not:
+#   * no build cache (a cache would hold the build stage, sources included, and caches are read
+#     by workflows of pull requests from forks); no build record or summary uploaded;
+#   * the compiler's output is not printed (LEX_BUILD_QUIET); the tests print their totals and,
+#     on a failure, the names of the classes that failed -- not their tracebacks;
+#   * no artifact holds anything but an image digest;
+#   * nothing runs on a pull request: only a tag, or a run started by hand by a maintainer.
+#
+# Secrets: LEX_SOURCE_DEPLOY_KEY (a read-only deploy key of eMondrian/emondrian-lex),
+# DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (write access to emondrian/lex). Variable, optional:
+# LEX_ARM_RUNNER, another label for the arm64 runner.
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "the emondrian-lex tag to build and publish again (v1.2.3)"
+        required: true
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: emondrian/lex
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  DOCKER_BUILD_SUMMARY: "false"
+
+jobs:
+  build:
+    if: github.repository == 'eMondrian/lex-community'
+    name: build ${{ matrix.arch }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            platform: linux/arm64
+            runner: arm
+    runs-on: ${{ matrix.runner == 'arm' && (vars.LEX_ARM_RUNNER || 'ubuntu-24.04-arm') || matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Check the tag
+        run: |
+          case "$TAG" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "not a version tag: $TAG"; exit 1;; esac
+
+      - name: The source, at ${{ env.TAG }}
+        uses: actions/checkout@v6
+        with:
+          repository: eMondrian/emondrian-lex
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.LEX_SOURCE_DEPLOY_KEY }}
+          path: src
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the test image
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          target: test
+          platforms: ${{ matrix.platform }}
+          build-args: LEX_BUILD_QUIET=1
+          load: true
+          tags: lex-test:ci
+
+      - name: The fast tests, on the compiled core (totals only)
+        run: |
+          if docker run --rm lex-test:ci > /tmp/tests.log 2>&1; then
+            grep -E '^fast:|^OK' /tmp/tests.log
+          else
+            grep -E '^fast:|^FAILED' /tmp/tests.log || echo "the tests did not run"
+            exit 1
+          fi
+
+      - name: Build the release image
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          target: release
+          platforms: ${{ matrix.platform }}
+          build-args: LEX_BUILD_QUIET=1
+          load: true
+          tags: ${{ env.IMAGE }}:ci
+
+      - name: Start it on an empty volume
+        run: |
+          docker run -d --name lex -p 8770:8770 -v lex-ci:/data "$IMAGE:ci"
+          for i in $(seq 1 90); do
+            if curl -fsS -o /dev/null http://127.0.0.1:8770/healthz; then break; fi
+            if [ "$i" = 90 ]; then echo "no answer from /healthz"; docker rm -f lex; exit 1; fi
+            sleep 1
+          done
+          curl -fsS -o /dev/null http://127.0.0.1:8770/
+          curl -fsS http://127.0.0.1:8770/mcp -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | grep -q '"job_status"'
+          docker exec lex git -C /data/base log --oneline
+          docker rm -f lex
+          echo "the image answers: web, MCP, a new base"
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push by digest
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: src
+          target: release
+          platforms: ${{ matrix.platform }}
+          build-args: LEX_BUILD_QUIET=1
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          labels: |
+            org.opencontainers.image.title=eMondrian Lex
+            org.opencontainers.image.version=${{ env.TAG }}
+            org.opencontainers.image.url=https://github.com/eMondrian/lex-community
+
+      - name: Keep the digest
+        run: |
+          mkdir -p /tmp/digests
+          d="${{ steps.push.outputs.digest }}"
+          touch "/tmp/digests/${d#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish ${{ github.event.inputs.tag || github.ref_name }}
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Join the two architectures under the tags
+        working-directory: /tmp/digests
+        run: |
+          v="${TAG#v}"
+          docker buildx imagetools create -t "$IMAGE:$v" -t "$IMAGE:${v%.*}" $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$v"
+
+  bump:
+    name: docker-compose.yml names ${{ github.event.inputs.tag || github.ref_name }}
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+      - name: Point the compose file at the new version
+        run: |
+          v="${TAG#v}"
+          sed -i -E "s#(image: emondrian/lex:\\\$\{LEX_VERSION:-)[^}]*\}#\1$v}#" docker-compose.yml
+          sed -i -E "s#^([#]LEX_VERSION=).*#\1$v#" .env.example
+          if git diff --quiet; then echo "already at $v"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Lex $v: the compose file runs emondrian/lex:$v"
+          git push origin HEAD:main
