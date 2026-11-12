@@ -1,0 +1,7 @@
+# Caddy in front of Lex (docker compose --profile tls): TLS for LEX_DOMAIN, compression,
+# everything passed to the Lex container. MCP's answers are JSON, not a stream, so no
+# special handling is needed for /mcp.
+{$LEX_DOMAIN:localhost} {
+	encode zstd gzip
+	reverse_proxy lex:8770
+}

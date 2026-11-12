@@ -1,0 +1,49 @@
+# eMondrian Lex, community edition: one knowledge base, the web UI and MCP on one port.
+# Started by ./setup.sh; by hand: docker compose up -d  (with TLS: docker compose --profile tls up -d)
+#
+# Settings are in .env (made by setup.sh from .env.example). The knowledge base is ./base:
+# an empty directory becomes an empty base, under git, at the first start.
+name: lex
+
+services:
+  lex:
+    image: emondrian/lex:${LEX_VERSION:-0.1.0}
+    restart: unless-stopped
+    user: "${LEX_UID:-10001}:${LEX_GID:-10001}"
+    environment:
+      LEX_GIT_REMOTE: ${LEX_GIT_REMOTE:-}
+      LEX_GIT_BRANCH: ${LEX_GIT_BRANCH:-}
+      LEX_ROOT_PATH: ${LEX_ROOT_PATH:-}
+      LEX_AUTO_REGENERATE: ${LEX_AUTO_REGENERATE:-}
+      LEX_MCP_WAIT: ${LEX_MCP_WAIT:-25}
+      LEX_LOG_LEVEL: ${LEX_LOG_LEVEL:-info}
+      GIT_AUTHOR_NAME: ${LEX_GIT_NAME:-Lex}
+      GIT_AUTHOR_EMAIL: ${LEX_GIT_EMAIL:-lex@localhost}
+      GIT_COMMITTER_NAME: ${LEX_GIT_NAME:-Lex}
+      GIT_COMMITTER_EMAIL: ${LEX_GIT_EMAIL:-lex@localhost}
+    volumes:
+      - ./base:/data/base
+      # a key for pushing the base to a remote over ssh (LEX_GIT_REMOTE=git@...): see .env.example
+      - ${LEX_SSH_DIR:-./deploy/no-ssh}:/tmp/.ssh:ro
+    ports:
+      - "${LEX_BIND:-0.0.0.0}:${LEX_PORT:-8770}:8770"
+
+  # TLS in front of Lex, for LEX_DOMAIN (a public name: a Let's Encrypt certificate).
+  caddy:
+    profiles: ["tls"]
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on: [lex]
+    environment:
+      LEX_DOMAIN: ${LEX_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:

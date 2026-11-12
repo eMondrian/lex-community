@@ -1,0 +1,6 @@
+# your settings and your knowledge base: never part of this repository
+.env
+base/*
+!base/.gitkeep
+deploy/no-ssh/*
+!deploy/no-ssh/.gitkeep
